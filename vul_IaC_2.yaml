@@ -1,0 +1,459 @@
+AWSTemplateFormatVersion: '2010-09-09'  
+Description: Vulnerable IaC Infrastructure no.2  
+
+Parameters:  
+  Environment:  
+    Type: String  
+    Default: dev 
+    AllowedValues: [dev, prod]  
+    Description: Environment type  
+
+Resources:  
+
+#------------IAM 리소스 정의---------------#
+
+  # IAM 역할 1 정의 (모든 AWS 계정/모든 리소스가 가질 수 있음)
+  # 구성 오류: 모든 AWS 계정에서 역할 부여받기 가능, 관리자 권한, S3/DynamoDB에 대한 모든 권한을 모든 리소스가 가질 수 있음
+  VulnerableWebServerRole:  
+    Type: AWS::IAM::Role  
+    Properties:  
+      AssumeRolePolicyDocument:  
+        Version: '2012-10-17' 
+        Statement:  
+          - Effect: Allow  
+            Principal:
+              AWS: '*'  
+            Action: sts:AssumeRole  
+      ManagedPolicyArns:  
+        - arn:aws:iam::aws:policy/AdministratorAccess 
+      Policies:  # 사용자 정의 정책 정의
+        - PolicyName: CustomInlinePolicy  
+          PolicyDocument: 
+            Version: '2012-10-17' 
+            Statement:  
+              - Effect: Allow  
+                Action: 
+                  - 's3:*' 
+                  - 'dynamodb:*' 
+                Resource: '*' 
+
+  # IAM 역할 2 정의 (EC2가 가질 수 있음) 
+  # 구성 오류: 긴 세션 지속 시간 (12시간), 넓은 역할 경로, 조건 없이 모든 리소스가 특정 S3 버킷의 모든 객체 읽기/쓰기 가능
+    Type: AWS::IAM::Role  
+    Properties:  
+      AssumeRolePolicyDocument:  
+        Version: '2012-10-17'  
+        Statement: 
+          - Effect: Allow  
+            Principal:
+              Service: ec2.amazonaws.com 
+            Action: sts:AssumeRole  
+      Path: '/data-science/'  
+      MaxSessionDuration: 43200  
+      Policies:  
+        - PolicyName: DataAccessPolicy  
+          PolicyDocument:
+            Version: '2012-10-17' 
+            Statement:  
+              - Effect: Allow 
+                Action:  
+                  - 's3:GetObject' 
+                  - 's3:PutObject'
+                Resource: !Sub 'arn:aws:s3:::${DataBucket}/*' 
+                Condition: {}  
+              - Effect: Allow  
+                Action: 'kms:*'  
+                Resource: '*' 
+
+  # IAM 역할 3 정의 (Lambda 사용 가능)
+  # 구성 오류:  모든 리소스가 CloudWatch Logs/AWS X-Ray에 대한 모든 작업 허용, 모든 시크릿값 읽기 가능 
+  LambdaExecutionRole:  
+    Type: AWS::IAM::Role 
+    Properties:  
+      AssumeRolePolicyDocument: 
+        Version: '2012-10-17' 
+        Statement:  
+          - Effect: Allow 
+            Principal:
+              Service: lambda.amazonaws.com 
+            Action: sts:AssumeRole 
+      Policies: 
+        - PolicyName: LambdaPolicy 
+          PolicyDocument: 
+            Version: '2012-10-17' 
+            Statement:  
+              - Effect: Allow 
+                Action:  
+                  - 'logs:*'  
+                  - 'xray:*'  
+                Resource: '*'  
+              - Effect: Allow  
+                Action: 'secretsmanager:GetSecretValue' 
+                Resource: '*'  
+
+  # IAM 역할 4 정의 (루트 계정에서만 역할 갖기 가능)
+  # 구성 오류: IAM을 제외한 모든 리소스에 대한 모든 작업 허용
+  BackupOperatorRole: 
+    Type: AWS::IAM::Role  
+    Properties: 
+      AssumeRolePolicyDocument: 
+        Version: '2012-10-17'  
+        Statement:  
+          - Effect: Allow 
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root' 
+            Action: sts:AssumeRole 
+      Policies:  
+        - PolicyName: BackupPolicy 
+          PolicyDocument: 
+            Version: '2012-10-17' 
+            Statement: 
+              - Effect: Allow  
+                NotAction: 'iam:*'  
+                Resource: '*'  
+
+  # IAM 사용자 1 정의 (관리자 그룹;AdminGroup에 속함) => admin-user
+  # 구성 오류: 하드코딩된 로그인 비밀번호(쉬움;Admin123!), 강제 비밀번호 초기 변경 비활성화
+  AdminUser: 
+    Type: AWS::IAM::User 
+    Properties:  
+      UserName: admin-user
+      Groups: 
+        - !Ref AdminGroup  
+      LoginProfile:  
+        Password: 'Admin123!'  
+        PasswordResetRequired: false  
+
+  # IAM 사용자 2 정의 (리소스에게 부여하는 사용자 자격증명) => service-account 
+  # 구성 오류: 모든 리소스에 대한 모든 작업이 허용됨
+  ServiceAccount:  
+    Type: AWS::IAM::User  
+    DependsOn: AdminGroup  
+    Properties: 
+      UserName: service-account 
+      Policies:  
+        - PolicyName: ServiceAccountPolicy 
+          PolicyDocument: 
+            Version: '2012-10-17' 
+            Statement:  
+              - Effect: Allow  
+                Action: '*'  
+                Resource: '*' 
+
+  # IAM 그룹 정의 (관리자 그룹) => admin-group
+  # 구성 오류: 전체 관리자 권한, 데이터베이스 관리자 권한 가짐
+  AdminGroup:  
+    Type: AWS::IAM::Group  
+    Properties:  
+      GroupName: admin-group  
+      ManagedPolicyArns:  
+        - arn:aws:iam::aws:policy/AdministratorAccess  
+        - arn:aws:iam::aws:policy/job-function/DatabaseAdministrator  
+
+  # IAM 관리형 정책 정의 
+  # 구성 오류: 사용자 정의 경로 사용, 모든 리소스가 EC2/RDS/ElasticCache에 대해 모든 작업 가능, 모든 리소스가 역할 전달 가능
+  CustomManagedPolicy:
+    Type: AWS::IAM::ManagedPolicy  
+    Properties: 
+      Description: Custom policy for developers
+      Path: '/custom/'  # 취약점: 사용자 정의 경로 사용
+      PolicyDocument:  
+        Version: '2012-10-17' 
+        Statement:  
+          - Effect: Allow 
+            Action:  
+              - 'ec2:*' 
+              - 'rds:*' 
+              - 'elasticache:*'  
+            Resource: '*' 
+          - Effect: Allow 
+            Action: 'iam:PassRole' 
+            Resource: '*' 
+
+  # 액세스 키 정의 (IAM 사용자 2;service-account의 액세스 키)
+  # 구성 오류: 활성 상태로 영구적으로 사용 가능
+  ServiceAccountAccessKey: 
+    Type: AWS::IAM::AccessKey 
+    Properties: 
+      UserName: !Ref ServiceAccount  
+      Status: Active 
+
+#-----------네트워크 리소스 정의----------#
+
+  # VPC 정의 (172.16.0.0/16)
+  VPC:  
+    Type: AWS::EC2::VPC 
+    Properties:  
+      CidrBlock: 172.16.0.0/16 
+      EnableDnsHostnames: true  
+      EnableDnsSupport: true 
+      Tags: 
+        - Key: Name  
+          Value: AlternativeVPC 
+
+  # IGW 정의 
+  InternetGateway:  
+    Type: AWS::EC2::InternetGateway 
+    Properties: 
+      Tags:  
+        - Key: Name  
+          Value: AlternativeIGW 
+
+  # VPC & 인터넷 게이트웨이 연결
+  VPCGatewayAttachment: 
+    Type: AWS::EC2::VPCGatewayAttachment  
+    Properties: 
+      VpcId: !Ref VPC 
+      InternetGatewayId: !Ref InternetGateway  
+
+  # 퍼블릭 서브넷 1 정의 (172.16.0.0/20, 첫 번째 AZ에 위치)
+  # 구성 오류: 퍼블릭 IP 자동 할당 
+  PublicSubnet1: 
+    Type: AWS::EC2::Subnet 
+    Properties:  
+      VpcId: !Ref VPC  
+      CidrBlock: 172.16.0.0/20  
+      AvailabilityZone: !Select [0, !GetAZs ''] 
+      MapPublicIpOnLaunch: true  
+
+  # 퍼블릭 서브넷 2 정의 (172.16.16.0/20, 세 번째 AZ에 위치)
+  # 구성 오류: 퍼블릭 IP 자동 할당 
+  PublicSubnet2: 
+    Type: AWS::EC2::Subnet 
+    Properties:  
+      VpcId: !Ref VPC 
+      CidrBlock: 172.16.16.0/20  
+      AvailabilityZone: !Select [2, !GetAZs '']  
+      MapPublicIpOnLaunch: true 
+      Tags:  
+        - Key: Network 
+          Value: Public 
+
+  # 프라이빗 서브넷 1 정의(172.16.32.0/20, 첫 번째 AZ에 위치)
+  PrivateSubnet1:
+    Type: AWS::EC2::Subnet 
+    Properties: 
+      VpcId: !Ref VPC
+      CidrBlock: 172.16.32.0/20 
+      AvailabilityZone: !Select [0, !GetAZs '']  
+      Tags:  
+        - Key: Type  
+          Value: Private  
+
+  # 프라이빗 서브넷 2 정의 (172.16.48.0/20, 두 번째 AZ에 위치)
+  PrivateSubnet2: 
+    Type: AWS::EC2::Subnet 
+    Properties:  
+      VpcId: !Ref VPC  
+      CidrBlock: 172.16.48.0/20 
+      AvailabilityZone: !Select [1, !GetAZs ''] 
+
+  # 퍼블릭 라우팅 테이블 정의 => 모든 IP로의 트래픽 허용
+  PublicRouteTable:  
+    Type: AWS::EC2::RouteTable  
+    Properties:  
+      VpcId: !Ref VPC 
+      Tags: 
+        - Key: Name  
+          Value: PublicRT  
+
+  # 퍼블릭 라우트 정의 
+  # 구성 오류: 모든 IP로의 트래픽 허용 
+  DefaultPublicRoute: 
+    Type: AWS::EC2::Route  
+    DependsOn: VPCGatewayAttachment  
+    Properties:  
+      RouteTableId: !Ref PublicRouteTable  
+      DestinationCidrBlock: 0.0.0.0/0  
+      GatewayId: !Ref InternetGateway 
+
+  # 퍼블릭 서브넷 1 & 퍼블릭 라우팅 테이블 연결 => 모든 IP로의 트래픽 허용
+  PublicSubnet1RouteTableAssoc: 
+    Type: AWS::EC2::SubnetRouteTableAssociation 
+    Properties: 
+      SubnetId: !Ref PublicSubnet1  
+      RouteTableId: !Ref PublicRouteTable 
+
+  # 퍼블릭 서브넷 2 & 퍼블릭 라우팅 테이블 연결 => 모든 IP로의 트래픽 허용
+  PublicSubnet2RouteTableAssoc:  
+    Type: AWS::EC2::SubnetRouteTableAssociation  
+    Properties: 
+      SubnetId: !Ref PublicSubnet2  
+      RouteTableId: !Ref PublicRouteTable  
+
+  # EC2 보안 그룹 정의 (인바운드 트래픽 허용)
+  # 구성 오류: 모든 IP 주소에서 오는 HTTP/SSH/RDP 트래픽 허용
+  WebServerSecurityGroup: 
+    Type: AWS::EC2::SecurityGroup  
+    Properties:  
+      GroupDescription: Security group for web servers  
+      VpcId: !Ref VPC  
+      SecurityGroupIngress: 
+        - IpProtocol: tcp  
+          FromPort: 80 
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp  
+          FromPort: 22  
+          ToPort: 22
+          CidrIp: 0.0.0.0/0  
+        - IpProtocol: tcp 
+          FromPort: 3389 
+          ToPort: 3389
+          CidrIp: 0.0.0.0/0 
+
+  # DB 보안 그룹 정의 (EC2랑 같은 보안 그룹 사용; 인바운드 트래픽 허용)
+  # 구성 오류: 모든 IP 주소에서 오는 HTTP/SSH/RDP/PostgreSQL 트래픽 허용
+  DatabaseSecurityGroup:  
+    Type: AWS::EC2::SecurityGroup 
+    Properties: 
+      GroupDescription: Security group for databases 
+      VpcId: !Ref VPC  
+      SecurityGroupIngress: 
+        - IpProtocol: tcp 
+          FromPort: 5432 
+          ToPort: 5432
+          CidrIp: 0.0.0.0/0 
+
+#----------스토리지 리소스 정의-----------#
+
+  # S3 버킷 1 정의 (로그 저장용)
+  # 구성 오류: 버전 관리 비활성화, 퍼블릭 ACL/정책 차단 및 무시 비활성화, 퍼블릭 버킷 제한 비활성화, 버킷 소유자/업로드 사용자 불일치 가능성
+  LoggingBucket:  
+    Type: AWS::S3::Bucket  
+    Properties:  
+      VersioningConfiguration: 
+        Status: Suspended  
+      PublicAccessBlockConfiguration:  
+        BlockPublicAcls: false  
+        BlockPublicPolicy: false  
+        IgnorePublicAcls: false 
+        RestrictPublicBuckets: false 
+      OwnershipControls: 
+        Rules:
+          - ObjectOwnership: BucketOwnerPreferred  # 업로드하는 사람이랑 버킷 소유하는 사람이랑 따로 존재 가능
+
+  # S3 버킷 2 정의 (데이터 저장용)
+  # 구성 오류: 버킷 소유자/업로드 사용자 불일치 가능성
+  DataBucket:  
+    Type: AWS::S3::Bucket  
+    Properties: 
+      OwnershipControls: 
+        Rules:
+          - ObjectOwnership: BucketOwnerPreferred  
+      Tags:  
+        - Key: Purpose 
+          Value: DataStorage 
+
+#----------컴퓨팅 리소스 정의------------#
+
+  # 퍼블릭 EC2 인스턴스 1 정의 (퍼블릭 서브넷 1에 위치;모든 IP로의 트래픽 허용)
+  # 구성 오류: EBS 볼륨 암호화 비활성화, DB URL 하드코딩, 모든 IP 주소에서 오는 HTTP/SSH/RDP 트래픽 허용
+  WebServer1: 
+    Type: AWS::EC2::Instance 
+    DependsOn: [VPCGatewayAttachment, PublicSubnet1RouteTableAssoc] 
+    Properties: 
+      ImageId: ami-0e4a9ad2eb120e054 
+      InstanceType: t2.micro  
+      SubnetId: !Ref PublicSubnet1 
+      SecurityGroupIds: [!Ref WebServerSecurityGroup]  # 보안 그룹 참조
+      BlockDeviceMappings: 
+        - DeviceName: /dev/xvda  
+          Ebs:
+            VolumeSize: 30  
+            VolumeType: gp2  
+            Encrypted: false 
+      UserData:  
+        Fn::Base64: |  
+          #!/bin/bash
+          yum update -y
+          echo "DATABASE_URL=postgres://admin:insecure123@database.example.com:5432/mydb" >> /etc/environment
+
+  # 퍼블릭 EC2 인스턴스 2 정의 (퍼블릭 서브넷 2에 위치, 모든 IP로의 트래픽 허용)
+  # 구성 오류: 세부 모니터링 비활성화, 인스턴스 종료 시 삭제 설정
+  WebServer2: 
+    Type: AWS::EC2::Instance  
+    DependsOn: [VPCGatewayAttachment, PublicSubnet2RouteTableAssoc]  
+    Properties: 
+      ImageId: ami-0e4a9ad2eb120e054 
+      InstanceType: t2.micro  
+      SubnetId: !Ref PublicSubnet2  
+      SecurityGroupIds: [!Ref WebServerSecurityGroup]  
+      Monitoring: false 
+      InstanceInitiatedShutdownBehavior: terminate 
+
+  # Lambda 함수 정의
+  # 구성 오류: 긴 타임아웃 설정, X-Ray 비활성화
+  ProcessingFunction:  
+    Type: AWS::Lambda::Function  
+    DependsOn: LambdaExecutionRole 
+    Properties: 
+      Handler: index.handler  
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Code:  
+        ZipFile: |  
+          exports.handler = async (event) => {
+            return { statusCode: 200, body: 'Hello World' };
+          }
+      Runtime: nodejs18.x
+      Timeout: 180 
+      TracingConfig:
+        Mode: PassThrough  
+
+  # RDS 인스턴스 정의 (PostgreSQL) => 모든 IP 주소에서 오는 HTTP/SSH/RDP/PostgreSQL 트래픽 허용
+  # 구성 오류: 쉬운 Admin 사용자 이름/비밀번호, 비밀번호 하드코딩, 퍼블릭 액세스 허용, 스토리지 암호화/백업/삭제 보호 비활성화
+  PostgreSQLInstance:  
+    Type: AWS::RDS::DBInstance  
+    DependsOn: DBSubnetGroup 
+    Properties: 
+      Engine: postgres  
+      EngineVersion: '13.13'  
+      DBInstanceClass: db.t3.micro 
+      AllocatedStorage: 20 
+      MasterUsername: dbadmin  
+      MasterUserPassword: insecure123!  
+      PubliclyAccessible: true 
+      VPCSecurityGroups: [!Ref DatabaseSecurityGroup]  
+      DBSubnetGroupName: !Ref DBSubnetGroup  
+      Port: 5432 
+      StorageEncrypted: false  
+      BackupRetentionPeriod: 0  
+      DeletionProtection: false 
+
+  # ElastiCache 클러스터 정의 (데이터를 메모리에 캐싱하는 기능, Redis 엔진 사용)
+  # 구성 오류: 모든 IP 주소에서 오는 HTTP/SSH/RDP/PostgreSQL 트래픽 허용
+  RedisCluster: 
+    Type: AWS::ElastiCache::CacheCluster 
+    DependsOn: CacheSubnetGroup 
+    Properties:  
+      Engine: redis 
+      CacheNodeType: cache.t3.micro  
+      NumCacheNodes: 1 
+      VpcSecurityGroupIds: [!Ref DatabaseSecurityGroup] 
+      CacheSubnetGroupName: !Ref CacheSubnetGroup  
+
+  # Redis용 프라이빗 서브넷 그룹 정의 (프라이빗 서브넷 1, 2에 위치)
+  CacheSubnetGroup: 
+    Type: AWS::ElastiCache::SubnetGroup 
+    Properties: 
+      Description: Subnet group for Redis cluster  
+      SubnetIds: [!Ref PrivateSubnet1, !Ref PrivateSubnet2]  
+
+  # KMS 키 정의
+  # 구성 오류: 키 회전 비활성화, 루트 계정 키 접근 가능 및 모든 리소스를 대상으로 하는 KMS 작업 허용
+  CustomKey: 
+    Type: AWS::KMS::Key 
+    Properties:  
+      Description: Custom encryption key 
+      EnableKeyRotation: false 
+      KeyPolicy:  
+        Version: '2012-10-17'  
+        Statement:  
+          - Sid: Enable IAM User Permissions  
+            Effect: Allow  
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root' 
+            Action: 'kms:*' 
+            Resource: '*' 
+
+

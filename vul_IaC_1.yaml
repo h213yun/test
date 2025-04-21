@@ -1,0 +1,257 @@
+AWSTemplateFormatVersion: '2010-09-09' 
+Description: Vulnerable IaC Infrastructure no.1
+
+Parameters: 
+  DBInstanceIdentifier:  
+    Type: String 
+    Default: vulnerable-db-instance # RDS 인스턴스 참조용 매개변수
+    Description: Unique identifier for the RDS instance  
+
+Resources: 
+  # 네트워크 구성 요소 정의
+
+  # VPC 정의: 10.0.0.0/16
+  VPC:  
+    Type: AWS::EC2::VPC  
+    Properties:  
+      CidrBlock: 10.0.0.0/16  
+      EnableDnsHostnames: true  
+      EnableDnsSupport: true 
+      Tags:  
+        - Key: Name  
+          Value: VulnerableVPC  
+
+  # EC2의 인터넷 게이트웨이 정의
+  InternetGateway:  
+    Type: AWS::EC2::InternetGateway 
+    Properties: 
+      Tags:  
+        - Key: Name  
+          Value: VulnerableIGW 
+
+  # VPC와 인터넷 게이트웨이 연결
+  AttachGateway:  
+    Type: AWS::EC2::VPCGatewayAttachment  
+    Properties:  
+      VpcId: !Ref VPC  
+      InternetGatewayId: !Ref InternetGateway  
+
+  # 퍼블릭 서브넷 1 정의: 10.0.1.0/24(VPC 범위인 10.0.0.0/16 중)
+  PublicSubnet1:  
+    Type: AWS::EC2::Subnet  
+    Properties: 
+      VpcId: !Ref VPC  
+      CidrBlock: 10.0.1.0/24 
+      AvailabilityZone: !Select [0, !GetAZs ''] # 가용 영역 선택 (첫 번째 영역)
+      MapPublicIpOnLaunch: true  # EC2 인스턴스에 퍼블릭 IP 할당
+      Tags:  
+        - Key: Name  
+          Value: VulnerablePublicSubnet1 
+
+  # 퍼블릭 서브넷 2 정의: 10.0.2.0/24(VPC 범위인 10.0.0.0/16 중)
+  PublicSubnet2: 
+    Type: AWS::EC2::Subnet  
+    Properties:  
+      VpcId: !Ref VPC  
+      CidrBlock: 10.0.2.0/24  
+      AvailabilityZone: !Select [1, !GetAZs '']  # 가용 영역 선택 (두 번째 영역)
+      MapPublicIpOnLaunch: true  # EC2 인스턴스에 퍼블릭 IP 할당
+      Tags:  
+        - Key: Name  
+          Value: VulnerablePublicSubnet2  
+
+  # 퍼블릭 라우팅 테이블 정의: VPC에 추가
+  PublicRouteTable:  
+    Type: AWS::EC2::RouteTable  
+    DependsOn: AttachGateway 
+    Properties:  
+      VpcId: !Ref VPC  
+      Tags:  
+        - Key: Name  
+          Value: VulnerablePublicRT  
+
+  # 퍼블릭 트래픽 라우트 정의: 라우팅 테이블에 추가, 모든 IP 주소 범위로 나가는 트래픽 허용(인터넷 게이트웨이에 연결)
+  PublicRoute:  
+    Type: AWS::EC2::Route  
+    DependsOn: AttachGateway  
+    Properties:  
+      RouteTableId: !Ref PublicRouteTable  
+      DestinationCidrBlock: 0.0.0.0/0 
+      GatewayId: !Ref InternetGateway 
+
+  # 퍼블릭 서브넷 1 & 퍼블릭 라우팅 테이블 연결
+  PublicSubnet1RouteTableAssociation:  
+    Type: AWS::EC2::SubnetRouteTableAssociation  
+    Properties: 
+      SubnetId: !Ref PublicSubnet1 
+      RouteTableId: !Ref PublicRouteTable  
+
+  # 퍼블릭 서브넷 2 & 퍼블릭 라우팅 테이블 연결
+  PublicSubnet2RouteTableAssociation:  
+    Type: AWS::EC2::SubnetRouteTableAssociation  
+    Properties:  
+      SubnetId: !Ref PublicSubnet2  
+      RouteTableId: !Ref PublicRouteTable 
+
+  # EC2의 보안 그룹 정의
+  # 구성 오류: 모든 인바운드/아웃바운드 트래픽 허용(모든 프로토콜, 포트, IP 주소)
+  VulnerableSecurityGroup:  
+    Type: AWS::EC2::SecurityGroup 
+    Properties: 
+      GroupDescription: "Allow all inbound traffic"  
+      VpcId: !Ref VPC  
+      SecurityGroupIngress:  
+        - IpProtocol: -1  
+          FromPort: -1  
+          ToPort: -1  
+          CidrIp: 0.0.0.0/0  
+      SecurityGroupEgress: 
+        - IpProtocol: -1  
+          FromPort: -1  
+          ToPort: -1 
+          CidrIp: 0.0.0.0/0  
+
+  # S3 버킷 정의
+  # 구성 오류: 객체 소유 권한의 범위가 넓음, 퍼블릭 액세스 가능(퍼블릭 ACL/Policy/버킷 차단 및 무시 비활성화), 버킷 버전 관리 중지
+  VulnerableS3Bucket: 
+    Type: AWS::S3::Bucket  
+    Properties:  
+      OwnershipControls: 
+        Rules:
+          - ObjectOwnership: ObjectWriter  # 객체를 업로드한 사용자가 소유권을 가지므로 객체 레벨의 IAM 권한 충돌 및 적법하지 않은 데이터의 열람이나 삭제를 야기할 수 있음
+      PublicAccessBlockConfiguration:  
+        BlockPublicAcls: false  
+        BlockPublicPolicy: false 
+        IgnorePublicAcls: false  
+        RestrictPublicBuckets: false  
+      VersioningConfiguration:  
+        Status: Suspended  
+
+  # S3 버킷 정책 정의
+  # 구성 오류: 퍼블릭한 객체 Read/Write 설정(모든 사용자가 모든 객체 리소스에 대하여)
+  VulnerableS3BucketPolicy:  
+    Type: AWS::S3::BucketPolicy  
+    Properties:  
+      Bucket: !Ref VulnerableS3Bucket 
+      PolicyDocument: 
+        Version: '2012-10-17'  
+        Statement:  
+          - Sid: PublicReadGetObject  
+            Effect: Allow  
+            Principal: '*'  
+            Action: 
+              - 's3:GetObject'  
+              - 's3:PutObject'  
+            Resource: !Sub '${VulnerableS3Bucket.Arn}/*' 
+
+  # EC2 인스턴스 정의: 퍼블릭 서브넷 1의 EC2 인스턴스 
+  # 구성 오류: 모든 인바운드/아웃바운드 트래픽 허용, EBS 볼륨 암호화/최적화 비활성화, AWS 액세스 키/시크릿 키 인스턴스 내부에 평문 저장, 루트 로그인 허용, 
+  VulnerableEC2Instance:  
+    Type: AWS::EC2::Instance  
+    DependsOn: PublicRoute  
+    Properties:  
+      ImageId: ami-0e4a9ad2eb120e054 
+      InstanceType: t2.micro  
+      SubnetId: !Ref PublicSubnet1  # 퍼블릭 서브넷 1에 배치 
+      SecurityGroupIds:  
+        - !Ref VulnerableSecurityGroup  # 취약한 보안 그룹 참조 (모든 인바운드/아웃바운드 트래픽 허용)
+      BlockDeviceMappings:  
+        - DeviceName: /dev/xvda  
+          Ebs:
+            VolumeSize: 8  
+            VolumeType: gp2 
+            Encrypted: false  
+      UserData:  
+        Fn::Base64: |  
+          #!/bin/bash
+          echo "AWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE" >> /etc/environment  # AWS 액세스 키 설정
+          echo "AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY" >> /etc/environment  # AWS 시크릿 키 설정
+          echo "PermitRootLogin yes" >> /etc/ssh/sshd_config  # 루트 로그인 허용
+          service sshd restart  # SSH 데몬 재시작
+      EbsOptimized: false  
+      Tags:  
+        - Key: Name 
+          Value: VulnerableInstance 
+
+  # IAM 역할 정의: EC2 인스턴스가 가질 수 있는 역할
+  # 구성 오류: 관리자 권한 허용(모든 AWS 리소스에 대한 삭제/변경/유출이 가능)
+  VulnerableIAMRole: 
+    Type: AWS::IAM::Role 
+    Properties:  
+      AssumeRolePolicyDocument:  
+        Version: '2012-10-17' 
+        Statement: 
+          - Effect: Allow  
+            Principal:
+              Service: ec2.amazonaws.com  # EC2 서비스가 역할을 가질 수 있도록 허용; 해당 EC2 인스턴스를 공격자가 제어할 경우 역할 권한을 악용하여 AWS 리소스에 무제한 접근 가능
+            Action: sts:AssumeRole  
+      ManagedPolicyArns:  
+        # 관리자 권한 정책 연결; 공격자는 AWS 리소스에 대한 모든 권한을 가질 수 있으며 모든 AWS 리소스를 삭제, 변경, 또는 유출할 수 있다. 또한, 해당 설정은 최소 권한 원칙에도 위배된다.
+        - arn:aws:iam::aws:policy/AdministratorAccess  
+      Policies: 
+        # 사용자 정의 정책 정의; 사용자 정의 정책을 추가해 모든 AWS 리소스에 대한 모든 작업을 허용하고 있다. 이러한 IAM 역할 또한, 최소 권한 원칙에 위배된다. 
+        - PolicyName: VulnerablePolicy  
+          PolicyDocument:  
+            Version: '2012-10-17'  
+            Statement:  
+              - Effect: Allow  
+                Action: '*'  
+                Resource: '*'
+
+  # RDS용 서브넷 그룹 정의
+  # 구성 오류: 퍼블릭 서브넷에 RDS 인스턴스 배치; 인터넷을 통해 DB에 접근 가능
+  DBSubnetGroup:  
+    Type: AWS::RDS::DBSubnetGroup 
+    Properties:  
+      DBSubnetGroupDescription: "Vulnerable DB subnet group"  
+      SubnetIds:  # 서브넷 그룹에 퍼블릭 서브넷 1, 2 포함(얘네를 사용한단 뜻)
+        - !Ref PublicSubnet1  
+        - !Ref PublicSubnet2  
+
+  # RDS 인스턴스 정의
+  # 구성 오류: DB 엔진 버전 확인 누락, 취약한 관리자 이름/비밀번호(평문), 모든 인바운드/아웃바운드 트래픽 허용, 퍼블릭 서브넷에 위치, 퍼블릭 액세스 허용, 스토리지 암호화/태그 복사/자동 백업 비활성화
+  VulnerableRDSInstance:  
+    Type: AWS::RDS::DBInstance  
+    Properties:  
+      Engine: mysql 
+      EngineVersion: 8.0.35  
+      DBInstanceIdentifier: !Ref DBInstanceIdentifier  
+      DBName: vulndb  
+      DBInstanceClass: db.t3.micro  
+      AllocatedStorage: 20  
+      MasterUsername: admin  
+      MasterUserPassword: insecure123!  
+      PubliclyAccessible: true  # 퍼블릭 액세스 허용
+      VPCSecurityGroups: 
+        - !Ref VulnerableSecurityGroup  # 취약한 보안 그룹 사용; 모든 인바운드/아웃바운드 트래픽 허용
+      DBSubnetGroupName: !Ref DBSubnetGroup  # 퍼블릭 서브넷 1, 2에 연결
+      StorageEncrypted: false 
+      CopyTagsToSnapshot: false  
+      BackupRetentionPeriod: 0  
+
+Outputs:  
+  VPCId:  
+    Description: VPC ID 
+    Value: !Ref VPC  
+
+  PublicSubnet1Id:  
+    Description: Public Subnet 1 ID  
+    Value: !Ref PublicSubnet1  
+
+  PublicSubnet2Id:  
+    Description: Public Subnet 2 ID  
+    Value: !Ref PublicSubnet2 
+
+  BucketName: 
+    Description: Name of the vulnerable S3 bucket 
+    Value: !Ref VulnerableS3Bucket  
+
+  EC2InstanceId: 
+    Description: ID of the vulnerable EC2 instance 
+    Value: !Ref VulnerableEC2Instance  
+
+  RDSEndpoint: 
+    Description: Endpoint of the vulnerable RDS instance 
+    Value: !GetAtt VulnerableRDSInstance.Endpoint.Address 
+  
+
